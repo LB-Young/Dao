@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import math
-
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 # 层归一化
@@ -35,7 +36,7 @@ class DaoLayerNorm(nn.Module):
             self.gamma * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)) : batch * seq_len * dim（batch * seq_len * dim 对位乘 dim， 其中dim会自动broadcast为batch * seq_len * dim）
         """
         return self.gamma * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps))
-      
+
 def rope_freq_cis(dim, max_len, theta=10000.0):
     """
     Args:
@@ -288,9 +289,6 @@ class DaoModel(nn.Module):
 
         self.layers = nn.ModuleList([DaoBlock(self.dao_block_config) for _ in self.num_layers])
 
-        self.head_layer_norm = DaoLayerNorm(self.hidden_size)
-        self.head_layer = nn.Linear(self.hidden_size, self.vocab_size)
-
         # 将预计算的位置编码（freqs_cos和freqs_sin）注册为模型的缓冲区
         # 这样这些张量会被保存到模型状态中，但不会被视为模型参数（不会在反向传播中更新）
         # 使用register_buffer可以确保这些张量在模型移动到不同设备（如GPU）时自动跟随模型一起移动
@@ -315,17 +313,33 @@ class DaoModel(nn.Module):
             h, past_key_value = layer(h, mask, pos_emb, past_key_value, use_cache)
             new_key_value.append(past_key_value)
 
-        h = self.head_layer_norm(h)
-        h = self.head_layer(h)
-
         return h, new_key_value
 
-class DaoCasualLLM:
-    def __init__(self):
-        pass
+class DaoCasualLLM(PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = DaoModel(config)
 
-    def generate_response(self):
+        self.head_layer_norm = DaoLayerNorm(self.hidden_size)
+        self.lm_head = nn.Linear(self.hidden_size, self.vocab_size)
+        self.model.embedding.weight = self.lm_head.weight
+        self.out = CasualLMOutputWithPast()
+
+    def generate_response(self, input_ids, mask, past_key_value=None, use_cache=False, logits_to_keep=0,  **args):
         """
-        
+        Args:
+            input_ids: (batch_size, seq_len)
+            mask: (batch_size, seq_len)
+            past_key_value: (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
+            use_cache: bool
+        Returns:
+            output_ids: (batch_size, seq_len)
         """
-        pass
+        h, past_key_value = self.model(input_ids, mask, past_key_value, use_cache)
+        h = self.head_layer_norm(h)
+        logits = self.lm_head(h)
+
+        self.out.__setattr__("logits", logits)
+        self.out.__setattr__("past_key_value", past_key_value)
+        self.out.__setattr__("last_hidden_state", h)
+        return self.out
