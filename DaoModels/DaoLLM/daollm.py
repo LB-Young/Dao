@@ -36,6 +36,23 @@ class DaoLayerNorm(nn.Module):
         """
         return self.gamma * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps))
       
+def rope_freq_cis(dim, max_len, theta=10000.0):
+    """
+    Args:
+        dim: 每个token的维度
+        max_len: 最大长度
+        theta: 缩放因子
+    Returns:
+        cos: 余弦值
+        sin: 正弦值
+    """
+    freqs = 1 / (theta ** ((torch.range(0, dim, 2)[:dim//2])/dim))      # 当维度为偶数时，不需要[:dim//2]；当维度是奇数的时候，不加切片freqs会多一项，当维度是奇数的时候，最后一个维度没有配对维度与之旋转，需要去掉。
+    t = torch.arange(max_len, device=freqs.device)  # 每个token的位置
+    freqs = torch.outer(t, freqs).float()  # 每个token的频率    （max_len, dim//2）
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)     # (max_len, dim), 前一半与后一半相同
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)     # (max_len, dim), 前一半与后一半相同
+    return freqs_cos, freqs_sin
+
 def apply_rotary_pos_emb(q, k, cos, sin):
     """
     Apply rotary position embedding to the query and key tensors.
@@ -51,7 +68,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
     explain:
         rope作用的维度是head_dim维度上的所有元素。
-        在rope的公式推导中，head_dim维度上两两分组，每组内进行rope操作。在实现中是前一半和后一半做rope操作，是因为head_dim维度上的所有元素相互独立，是等价的，所以任意两个元素都可以做rope操作，不需要相邻元素。
+        在rope的公式推导中，head_dim维度上两两分组，每组内进行rope操作。在实现中是前一半和后一半做rope操作，是因为rope_freq_cis中在计算相位的时候就是concat了前一半和后一半。所以第一个元素和第dim//2+1的元素位置的三角函数是配对的[[cos, -sin]，[sin, cos]]；只不过是之前计算的应该是q、k的相邻元素，现在变成了q、k的第1个元素与第dim//2+1个元素计算、第2个元素与第dim//2+2个元素计算（由于q、k在dim维度上所有维度元素是等价的，所以可以这样计算）。
     """
     def rotate_half(x):
         """Rotates half the hidden dims of the input."""
@@ -120,7 +137,7 @@ class DaoMHA(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
 
-        return self.o_proj(attn_output)
+        return self.o_proj(attn_output), past_key_value
 
 
 class DaoGQA(nn.Module):
@@ -227,22 +244,81 @@ class DaoMOE:
         pass
 
 
-
 class DaoBlock:
-    def __init__(self):
-        pass
+    def __init__(self, dao_block_config):
+        self.dao_block_config = dao_block_config
 
-    def forward(self):
-        pass
+        attention_config = dao_block_config.get("attention")
+        self.attention = DaoAttention(attention_config)
+
+        feed_forward_config = dao_block_config.get("feed_forward")
+        if feed_forward_config.get("forward_type") == "MOE":
+            self.feed_forward = DaoMOE(feed_forward_config)
+        elif feed_forward_config.get("forward_type") == "FFN":
+            self.feed_forward = DaoFeedForward(feed_forward_config)
+        else:
+            raise ValueError(f"Invalid forward type: {feed_forward_config.get('forward_type')}")
+
+        self.attn_norm = DaoLayerNorm(self.hidden_dim)
+        self.ffn_norm = DaoLayerNorm(self.hidden_dim)
+
+    def forward(self, h, mask=None, pos_emb=None, past_key_value=None, use_cache=False):
+        residual = h
+        attn_output, past_key_value = self.attention(self.attn_norm(h), mask, pos_emb, past_key_value, use_cache)
+        h = residual + attn_output
+        ffn_output = self.feed_forward(self.ffn_norm(h))
+        h = residual + ffn_output
+        return h, past_key_value
 
 
-class DaoLLM:
-    def __init__(self):
-        pass
+class DaoModel(nn.Module):
+    def __init__(self, dao_model_config):
+        self.dao_model_config = dao_model_config
+        self.num_layers = dao_model_config.get("num_layers")
+        self.vocab_size = dao_model_config.get("vocab_size")
+        self.hidden_size = dao_model_config.get("hidden_size")
+        self.max_length = dao_model_config.get("max_length")
+        self.rope_theta = dao_model_config.get("rope_theta")
 
-    def forward(self):
-        pass
+        self.dao_block_config = dao_model_config.get("dao_block")
 
+        self.embedding = nn.Embedding(self.vocab_size, self.hidden_size)
+
+        freqs_cos, freqs_sin = rope_freq_cis(self.hidden_size, self.max_length)
+
+        self.layers = nn.ModuleList([DaoBlock(self.dao_block_config) for _ in self.num_layers])
+
+        self.head_layer_norm = DaoLayerNorm(self.hidden_size)
+        self.head_layer = nn.Linear(self.hidden_size, self.vocab_size)
+
+        # 将预计算的位置编码（freqs_cos和freqs_sin）注册为模型的缓冲区
+        # 这样这些张量会被保存到模型状态中，但不会被视为模型参数（不会在反向传播中更新）
+        # 使用register_buffer可以确保这些张量在模型移动到不同设备（如GPU）时自动跟随模型一起移动
+        self.register_buffer("freqs_cos", freqs_cos)
+        self.register_buffer("freqs_sin", freqs_sin)
+
+    def forward(self, input_ids, mask=None, past_key_value=None, use_cache=False):
+        past_key_value = past_key_value or [None] * self.num_layers
+
+        batch_size, seq_len = input_ids.shape[0], input_ids.shape[1]
+        start_pos = past_key_value[0][0].shape[1] if past_key_value[0] is not None else 0
+
+        h = self.embedding(input_ids)
+
+        pos_emb = (
+            self.freqs_cos[start_pos:start_pos+seq_len],
+            self.freqs_sin[start_pos:start_pos+seq_len]
+        )
+
+        new_key_value = []
+        for layer, past_key_value in zip(self.layers, past_key_value):
+            h, past_key_value = layer(h, mask, pos_emb, past_key_value, use_cache)
+            new_key_value.append(past_key_value)
+
+        h = self.head_layer_norm(h)
+        h = self.head_layer(h)
+
+        return h, new_key_value
 
 class DaoCasualLLM:
     def __init__(self):
