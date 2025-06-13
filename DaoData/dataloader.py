@@ -40,7 +40,6 @@ class PretrainDataGenerator(BaseDataGenerator):
             truncation=True,
             return_tensors="pt"
         )
-        breakpoint()
         input_ids = encoding['input_ids'].squeeze()
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
 
